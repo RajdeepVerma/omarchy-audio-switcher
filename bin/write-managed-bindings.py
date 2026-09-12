@@ -14,6 +14,9 @@ The transaction is intentionally conservative:
     directory and everything below it must be owned by the effective user;
   * the target file is read through a file descriptor and its identity
     (device, inode, mtime, size) is recorded;
+  * both the existing file and the rendered result are bounded (MAX_TARGET_BYTES)
+    before they are allocated or written, so an oversized bindings.lua cannot
+    amplify into large memory use or disk writes on shell startup;
   * the replacement is written to a fresh O_EXCL temp file in the same
     directory, fsync'd, then renamed into place with renameat semantics;
   * the identity is re-checked immediately before the rename, so a concurrent
@@ -21,7 +24,7 @@ The transaction is intentionally conservative:
 
 Exit codes:
   0  updated, or already current
-  2  refused (unsafe path, ownership, mode, or non-UTF-8 content)
+  2  refused (unsafe path, ownership, mode, oversized content, or non-UTF-8 content)
   3  refused because bindings.lua changed concurrently; the caller may retry
   4  usage error
 """
@@ -35,6 +38,10 @@ START = "-- BEGIN audio-switcher (managed, do not edit)"
 END = "-- END audio-switcher (managed, do not edit)"
 TARGET_NAME = "bindings.lua"
 MAX_BLOCK_BYTES = 64 * 1024
+# Ceiling applied to both the existing bindings.lua and the rendered result.
+# A Hyprland bindings file is normally a few KB; this leaves generous headroom
+# while still bounding the read/decode/render/encode amplification.
+MAX_TARGET_BYTES = 1024 * 1024
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 
@@ -100,11 +107,19 @@ def read_current(dir_fd):
             refuse(2, "%s is not owned by the current user" % TARGET_NAME)
         if info.st_mode & 0o002:
             refuse(2, "%s is world-writable" % TARGET_NAME)
+        if info.st_size > MAX_TARGET_BYTES:
+            refuse(2, "%s exceeds %d bytes" % (TARGET_NAME, MAX_TARGET_BYTES))
+        # Re-check while reading: the size may grow after fstat, and the limit
+        # must hold before the whole file is allocated in memory.
         chunks = []
+        total = 0
         while True:
             chunk = os.read(target, 65536)
             if not chunk:
                 break
+            total += len(chunk)
+            if total > MAX_TARGET_BYTES:
+                refuse(2, "%s exceeds %d bytes" % (TARGET_NAME, MAX_TARGET_BYTES))
             chunks.append(chunk)
     finally:
         os.close(target)
@@ -152,6 +167,9 @@ def main():
         updated = render(current, block)
         if updated == current:
             return 0
+        rendered = updated.encode("utf-8")
+        if len(rendered) > MAX_TARGET_BYTES:
+            refuse(2, "rendered %s exceeds %d bytes" % (TARGET_NAME, MAX_TARGET_BYTES))
 
         tmp_name = ".bindings.lua.audio-switcher.%d" % os.getpid()
         tmp_fd = os.open(
@@ -161,7 +179,7 @@ def main():
             dir_fd=dir_fd,
         )
         try:
-            write_all(tmp_fd, updated.encode("utf-8"))
+            write_all(tmp_fd, rendered)
             os.fchmod(tmp_fd, mode)
             os.fsync(tmp_fd)
         finally:

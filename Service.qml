@@ -44,6 +44,8 @@ Item {
   readonly property string osdHelper: omarchyBin + "/omarchy-osd"
   readonly property string pythonInterpreter: "/usr/bin/python3"
   readonly property string bindingsWriter: decodeURIComponent(String(Qt.resolvedUrl("bin/write-managed-bindings.py")).replace(/^file:\/\//, ""))
+  readonly property string setsidBinary: "/usr/bin/setsid"
+  readonly property string killBinary: "/usr/bin/kill"
 
   // The environment handed to helpers is closed (clearEnvironment) and then
   // populated with only what they need: a fixed PATH for their own tool
@@ -130,12 +132,28 @@ Item {
 
   // ---------------- supervised helper execution ----------------
   // External helpers run one job at a time, by absolute path, with a closed
-  // environment. A watchdog puts a deadline on each job (terminate, then kill),
-  // output is consumed instead of accumulated, and the child is reaped before
-  // the next job starts.
+  // environment and inside a dedicated process group (setsid), so the deadline
+  // reaps descendants that inherited the output pipes. A watchdog terminates
+  // the whole group, then force-kills it. Output is consumed live (never
+  // buffered) and counts against a hard aggregate byte ceiling that ends the
+  // job immediately when exceeded.
   property var jobQueue: []
   property var activeJob: null
   readonly property int helperTimeoutMs: 8000
+  readonly property int maxHelperOutputBytes: 65536
+  readonly property int maxHelperStderrChars: 512
+
+  // Live aggregate accounting over both stdout and stderr. The parsers below
+  // discard what they read; only the byte count and a bounded stderr tail are
+  // kept, so a helper (or its descendant) that floods output cannot grow the
+  // shell's memory before the watchdog fires.
+  property int helperOutputBytes: 0
+  property string helperStderrTail: ""
+  property bool helperOutputCapped: false
+  // Process group id of the current helper (== its pid under setsid). Captured
+  // on start because the QML Process clears its own pid before `exited` fires.
+  property int helperGroupId: 0
+  property bool helperTeardown: false
 
   function enqueueJob(job) {
     job.retries = job.retries || 0
@@ -148,10 +166,63 @@ Item {
     enqueueJob({ argv: argv, label: label })
   }
 
+  function resetHelperOutput() {
+    helperOutputBytes = 0
+    helperStderrTail = ""
+    helperOutputCapped = false
+  }
+
+  function utf8Length(s) {
+    var n = 0
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i)
+      if (c <= 0x7f) n += 1
+      else if (c <= 0x7ff) n += 2
+      else if (c >= 0xd800 && c <= 0xdbff) { n += 4; i++ }
+      else n += 3
+    }
+    return n
+  }
+
+  function accountStdout(data) {
+    helperOutputBytes += utf8Length(data)
+    if (helperOutputBytes > maxHelperOutputBytes) capHelperOutput()
+  }
+
+  function accountStderr(data) {
+    helperOutputBytes += utf8Length(data)
+    if (helperStderrTail.length < maxHelperStderrChars)
+      helperStderrTail = (helperStderrTail + data).slice(0, maxHelperStderrChars)
+    if (helperOutputBytes > maxHelperOutputBytes) capHelperOutput()
+  }
+
+  // A helper that floods output is misbehaving: end the group now rather than
+  // letting the 8-second deadline race a runaway writer.
+  function capHelperOutput() {
+    if (helperOutputCapped) return
+    helperOutputCapped = true
+    helperTeardown = true
+    helperWatchdog.stop()
+    console.warn("audio-switcher: helper output exceeded " + maxHelperOutputBytes + " bytes; killing group")
+    signalHelperGroup("KILL")
+  }
+
+  // Signal the helper's whole process group. The group id equals the helper's
+  // pid because setsid makes it the session/group leader. A separate one-shot
+  // process is used because the QML Process can only signal a single pid.
+  function signalHelperGroup(sigName) {
+    if (!helperGroupId) return
+    groupSignal.command = [killBinary, "-" + sigName, "--", "-" + helperGroupId]
+    groupSignal.running = true
+  }
+
   function pumpJobs() {
     if (activeJob || jobQueue.length === 0) return
     activeJob = jobQueue.shift()
-    helper.command = activeJob.argv
+    helperTeardown = false
+    helperGroupId = 0
+    resetHelperOutput()
+    helper.command = [setsidBinary].concat(activeJob.argv)
     helper.running = true
     helperWatchdog.restart()
   }
@@ -160,12 +231,27 @@ Item {
     id: helper
     clearEnvironment: true
     environment: root.helperEnvironment
-    stdout: StdioCollector { id: helperStdout; waitForEnd: true }
-    stderr: StdioCollector { id: helperStderr; waitForEnd: true }
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(data) { root.accountStdout(data) }
+    }
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function(data) { root.accountStderr(data) }
+    }
+
+    onProcessIdChanged: {
+      var pid = helper.processId
+      if (pid) root.helperGroupId = pid
+    }
 
     onExited: function(exitCode, exitStatus) {
       helperWatchdog.stop()
       helperKill.stop()
+      // If a deadline or output cap ended this job, the direct child may be
+      // gone while descendants still hold the inherited pipes. SIGKILL the
+      // whole group to reap them before the next job starts.
+      if (root.helperTeardown) signalHelperGroup("KILL")
       var job = root.activeJob
       root.activeJob = null
       if (!job) return
@@ -178,12 +264,18 @@ Item {
         return
       }
       if (exitCode !== 0) {
-        var detail = helperStderr.text ? (": " + String(helperStderr.text).trim()) : ""
+        var detail = root.helperStderrTail ? (": " + root.helperStderrTail.trim()) : ""
         console.warn("audio-switcher: " + job.label + " exited " + exitCode + detail)
       }
       if (typeof job.onExit === "function") job.onExit(exitCode)
       root.pumpJobs()
     }
+  }
+
+  Process {
+    id: groupSignal
+    clearEnvironment: true
+    environment: root.helperEnvironment
   }
 
   Timer {
@@ -192,8 +284,9 @@ Item {
     repeat: false
     onTriggered: {
       if (!helper.running) return
-      console.warn("audio-switcher: helper exceeded " + root.helperTimeoutMs + "ms; terminating")
-      helper.running = false
+      helperTeardown = true
+      console.warn("audio-switcher: helper exceeded " + root.helperTimeoutMs + "ms; terminating group")
+      signalHelperGroup("TERM")
       helperKill.restart()
     }
   }
@@ -203,11 +296,11 @@ Item {
     interval: 2000
     repeat: false
     onTriggered: {
-      // Last resort: force-kill anything that ignored the terminate request,
-      // and make sure the queue can never stall behind a stuck child.
+      // Last resort: force-kill the whole group if it ignored the terminate
+      // request, and make sure the queue can never stall behind a stuck child.
       if (helper.running) {
-        console.warn("audio-switcher: helper ignored termination; killing")
-        helper.signal(9)
+        console.warn("audio-switcher: helper group ignored termination; killing")
+        signalHelperGroup("KILL")
       } else if (root.activeJob) {
         root.activeJob = null
         root.pumpJobs()

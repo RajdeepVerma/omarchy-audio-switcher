@@ -77,15 +77,20 @@ Settings are stored inline on the plugin's entry in `~/.config/omarchy/shell.jso
 - **No PATH lookups.** Omarchy helpers are invoked by absolute path with a
   closed, minimal environment (`PATH`, `HOME`, `XDG_RUNTIME_DIR` only), so the
   inherited shell environment cannot substitute a different binary.
-- **Supervised helpers.** Each helper is a supervised child process with a
-  deadline (terminate, then kill), consumed output, and no overlap between jobs.
+- **Supervised helpers.** Each helper runs one job at a time in a dedicated
+  process group (`setsid`) with a deadline: the watchdog terminates the whole
+  group (so descendants that inherited the output pipes are reaped), then
+  force-kills it. Output is consumed live and never buffered, and counts
+  against a hard aggregate byte ceiling that ends the job immediately if
+  exceeded.
 - **Safe bindings writes.** `bindings.lua` is updated by a bundled helper that
   performs a descriptor-bound, no-follow, ownership-validated transaction:
   every path component is opened with `O_NOFOLLOW`; the target and its ancestors
-  must be owned by the user and not group/other-writable; the result is written
-  to an `O_EXCL` temp file and fsynced; and the file identity is re-checked
-  immediately before an atomic rename, so a concurrent edit aborts (and is
-  retried) instead of being overwritten. Unrelated content is preserved.
+  must be owned by the user and not group/other-writable; the existing file and
+  the rendered result are both bounded before they are read or written; the
+  result is written to an `O_EXCL` temp file and fsynced; and the file identity
+  is re-checked immediately before an atomic rename, so a concurrent edit aborts
+  (and is retried) instead of being overwritten. Unrelated content is preserved.
 
 ## Notes
 
