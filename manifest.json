@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.solkkku.audio-switcher",
+  "name": "Sound Switcher",
+  "version": "1.0.0",
+  "author": "solkkku",
+  "license": "MIT",
+  "description": "Switch between audio profiles (output + input) via hotkeys or a bar button.",
+  "kinds": ["service", "bar-widget", "panel"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml",
+    "panel": "Toast.qml"
+  },
+  "barWidget": {
+    "displayName": "Sound Switcher",
+    "description": "Switch between audio profiles (output + input)",
+    "category": "Audio",
+    "allowMultiple": false
+  }
+}
