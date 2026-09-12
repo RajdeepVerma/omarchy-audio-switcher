@@ -16,6 +16,7 @@ An [Omarchy](https://omarchy.org/) Quattro shell plugin that switches between **
 
 - Omarchy Quattro (the Quickshell-based shell).
 - PipeWire + WirePlumber (the standard Omarchy audio stack).
+- Python 3 (`/usr/bin/python3`) for the bundled hotkey-writer helper.
 - Uses Omarchy-provided helpers: `omarchy-audio-output-set-default`, `omarchy-audio-input-set-default`, `omarchy-osd`, and `omarchy-notification-send`.
 
 ## Install
@@ -65,6 +66,26 @@ Settings are stored inline on the plugin's entry in `~/.config/omarchy/shell.jso
   ]
 }
 ```
+
+## Security
+
+- **Bounded input.** Every value read from `shell.json` or received over IPC is
+  sanitized before it is stored or rendered: control characters are stripped,
+  each field has a length cap, the profile list is capped at 32 entries and an
+  aggregate character budget, and hotkeys must match a strict `TOKEN + TOKEN`
+  grammar. Notification positions are constrained to a fixed set.
+- **No PATH lookups.** Omarchy helpers are invoked by absolute path with a
+  closed, minimal environment (`PATH`, `HOME`, `XDG_RUNTIME_DIR` only), so the
+  inherited shell environment cannot substitute a different binary.
+- **Supervised helpers.** Each helper is a supervised child process with a
+  deadline (terminate, then kill), consumed output, and no overlap between jobs.
+- **Safe bindings writes.** `bindings.lua` is updated by a bundled helper that
+  performs a descriptor-bound, no-follow, ownership-validated transaction:
+  every path component is opened with `O_NOFOLLOW`; the target and its ancestors
+  must be owned by the user and not group/other-writable; the result is written
+  to an `O_EXCL` temp file and fsynced; and the file identity is re-checked
+  immediately before an atomic rename, so a concurrent edit aborts (and is
+  retried) instead of being overwritten. Unrelated content is preserved.
 
 ## Notes
 

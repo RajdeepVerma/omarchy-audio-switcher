@@ -15,10 +15,45 @@ Item {
   readonly property string home: Quickshell.env("HOME")
   readonly property string moduleName: "io.github.solkkku.audio-switcher"
   readonly property string shellConfigPath: home + "/.config/omarchy/shell.json"
-  readonly property string bindingsPath: home + "/.config/hypr/bindings.lua"
   readonly property string defaultCycleHotkey: ""
   readonly property string defaultPreviousHotkey: ""
   readonly property string defaultNotificationPosition: "off"
+
+  // ---------------- input limits ----------------
+  // Values arrive from shell.json (hand-editable) and from IPC, so every field
+  // is bounded before it is retained or rendered into the managed Lua block.
+  // Counts, per-field lengths, the hotkey grammar, and an aggregate budget over
+  // the whole profile list all have hard ceilings.
+  readonly property int maxProfiles: 32
+  readonly property int maxNameLength: 64
+  readonly property int maxDeviceLength: 256
+  readonly property int maxHotkeyLength: 64
+  readonly property int maxIconCodepoints: 8
+  readonly property int maxTotalChars: 16384
+  readonly property var hotkeyPattern: /^[A-Za-z0-9]+(?: \+ [A-Za-z0-9]+)*$/
+  readonly property var notificationPositions: ["off", "top-right", "bottom-center"]
+
+  // ---------------- trusted helper identities ----------------
+  // Absolute paths only: helpers are never resolved through PATH. The Omarchy
+  // bin directory comes from the shell (OMARCHY_PATH), and the bundled writer
+  // resolves relative to this QML file so a relocated plugin still finds it.
+  readonly property string omarchyBin: String(omarchyPath || Quickshell.env("OMARCHY_PATH") || "/usr/share/omarchy").replace(/\/+$/, "") + "/bin"
+  readonly property string audioOutputHelper: omarchyBin + "/omarchy-audio-output-set-default"
+  readonly property string audioInputHelper: omarchyBin + "/omarchy-audio-input-set-default"
+  readonly property string notificationHelper: omarchyBin + "/omarchy-notification-send"
+  readonly property string osdHelper: omarchyBin + "/omarchy-osd"
+  readonly property string pythonInterpreter: "/usr/bin/python3"
+  readonly property string bindingsWriter: decodeURIComponent(String(Qt.resolvedUrl("bin/write-managed-bindings.py")).replace(/^file:\/\//, ""))
+
+  // The environment handed to helpers is closed (clearEnvironment) and then
+  // populated with only what they need: a fixed PATH for their own tool
+  // lookups, HOME for user-scoped state, and XDG_RUNTIME_DIR for the PipeWire
+  // and D-Bus sockets.
+  readonly property var helperEnvironment: ({
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "HOME": home,
+    "XDG_RUNTIME_DIR": String(Quickshell.env("XDG_RUNTIME_DIR") || "")
+  })
 
   // ---------------- config (read from shell.json) ----------------
   property var profiles: []
@@ -93,20 +128,99 @@ Item {
     onFileChanged: reload()
   }
 
-  FileView {
-    id: bindingsFile
-    path: root.bindingsPath
-    watchChanges: false
-    atomicWrites: true
-    printErrors: false
-    onLoaded: {
-      root.bindingsLoaded = true
-      root.writeBindingsNow()
-    }
-    onLoadFailed: root.bindingsLoaded = true
+  // ---------------- supervised helper execution ----------------
+  // External helpers run one job at a time, by absolute path, with a closed
+  // environment. A watchdog puts a deadline on each job (terminate, then kill),
+  // output is consumed instead of accumulated, and the child is reaped before
+  // the next job starts.
+  property var jobQueue: []
+  property var activeJob: null
+  readonly property int helperTimeoutMs: 8000
+
+  function enqueueJob(job) {
+    job.retries = job.retries || 0
+    job.label = job.label || String(job.argv[0])
+    jobQueue.push(job)
+    pumpJobs()
   }
-  property bool bindingsLoaded: false
-  property string pendingBindingsText: ""
+
+  function runHelper(argv, label) {
+    enqueueJob({ argv: argv, label: label })
+  }
+
+  function pumpJobs() {
+    if (activeJob || jobQueue.length === 0) return
+    activeJob = jobQueue.shift()
+    helper.command = activeJob.argv
+    helper.running = true
+    helperWatchdog.restart()
+  }
+
+  Process {
+    id: helper
+    clearEnvironment: true
+    environment: root.helperEnvironment
+    stdout: StdioCollector { id: helperStdout; waitForEnd: true }
+    stderr: StdioCollector { id: helperStderr; waitForEnd: true }
+
+    onExited: function(exitCode, exitStatus) {
+      helperWatchdog.stop()
+      helperKill.stop()
+      var job = root.activeJob
+      root.activeJob = null
+      if (!job) return
+      // Exit 3 is the writer's "changed underneath us" signal; retry a bounded
+      // number of times before giving up.
+      if (exitCode === 3 && job.retries > 0) {
+        job.retries -= 1
+        root.jobQueue.unshift(job)
+        helperRetry.restart()
+        return
+      }
+      if (exitCode !== 0) {
+        var detail = helperStderr.text ? (": " + String(helperStderr.text).trim()) : ""
+        console.warn("audio-switcher: " + job.label + " exited " + exitCode + detail)
+      }
+      if (typeof job.onExit === "function") job.onExit(exitCode)
+      root.pumpJobs()
+    }
+  }
+
+  Timer {
+    id: helperWatchdog
+    interval: root.helperTimeoutMs
+    repeat: false
+    onTriggered: {
+      if (!helper.running) return
+      console.warn("audio-switcher: helper exceeded " + root.helperTimeoutMs + "ms; terminating")
+      helper.running = false
+      helperKill.restart()
+    }
+  }
+
+  Timer {
+    id: helperKill
+    interval: 2000
+    repeat: false
+    onTriggered: {
+      // Last resort: force-kill anything that ignored the terminate request,
+      // and make sure the queue can never stall behind a stuck child.
+      if (helper.running) {
+        console.warn("audio-switcher: helper ignored termination; killing")
+        helper.signal(9)
+      } else if (root.activeJob) {
+        root.activeJob = null
+        root.pumpJobs()
+      }
+    }
+  }
+
+  Timer {
+    id: helperRetry
+    interval: 250
+    repeat: false
+    onTriggered: root.pumpJobs()
+  }
 
   function deviceLabel(node) {
     var label = String(node.nickname || node.description || node.name || "")
@@ -145,12 +259,12 @@ Item {
       outputMuteHotkey = ""
       notificationPosition = defaultNotificationPosition
     } else {
-      profiles = Array.isArray(entry.profiles) ? entry.profiles.map(sanitizeProfile) : []
-      cycleHotkey = String(entry.cycleHotkey || "").trim() || defaultCycleHotkey
-      previousHotkey = String(entry.previousHotkey || "").trim() || defaultPreviousHotkey
-      micMuteHotkey = String(entry.micMuteHotkey || "").trim()
-      outputMuteHotkey = String(entry.outputMuteHotkey || "").trim()
-      notificationPosition = String(entry.notificationPosition || "").trim() || defaultNotificationPosition
+      profiles = sanitizeProfileList(entry.profiles)
+      cycleHotkey = sanitizeHotkey(entry.cycleHotkey)
+      previousHotkey = sanitizeHotkey(entry.previousHotkey)
+      micMuteHotkey = sanitizeHotkey(entry.micMuteHotkey)
+      outputMuteHotkey = sanitizeHotkey(entry.outputMuteHotkey)
+      notificationPosition = sanitizeNotificationPosition(entry.notificationPosition)
     }
     configLoaded = true
     syncBindings()
@@ -174,15 +288,77 @@ Item {
     return null
   }
 
+  // Strip control characters and cap length. Applied to every free-form string
+  // before it is stored, compared, or interpolated into the managed Lua block.
+  function sanitizeText(value, maxLength) {
+    var text = String(value === undefined || value === null ? "" : value)
+    text = text.replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+    if (text.length > maxLength) text = text.slice(0, maxLength)
+    return text.trim()
+  }
+
+  // Icons are glyphs, not arbitrary text: keep at most a few code points and
+  // drop anything non-printable.
+  function sanitizeIcon(value) {
+    var text = String(value === undefined || value === null ? "" : value)
+    text = text.replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+    var points = Array.from(text)
+    if (points.length > maxIconCodepoints) points = points.slice(0, maxIconCodepoints)
+    return points.join("")
+  }
+
+  // Hotkeys must match a strict "TOKEN + TOKEN" grammar. Anything that could
+  // escape a Lua string literal (quotes, backslashes, newlines) is rejected
+  // rather than escaped.
+  function sanitizeHotkey(value) {
+    var text = sanitizeText(value, maxHotkeyLength)
+    if (!text) return ""
+    text = text.replace(/\s*\+\s*/g, " + ")
+    if (text.length > maxHotkeyLength) return ""
+    return hotkeyPattern.test(text) ? text : ""
+  }
+
+  function sanitizeNotificationPosition(value) {
+    var position = String(value === undefined || value === null ? "" : value).trim().toLowerCase()
+    return notificationPositions.indexOf(position) !== -1 ? position : defaultNotificationPosition
+  }
+
+  function profileChars(profile) {
+    return profile.name.length + profile.output.length + profile.input.length
+      + profile.hotkey.length + profile.icon.length
+  }
+
+  function profilesChars(list) {
+    var total = 0
+    for (var i = 0; i < list.length; i++) total += profileChars(list[i])
+    return total
+  }
+
   function sanitizeProfile(p) {
     p = p || {}
     return {
-      name: String(p.name || "").trim(),
-      output: String(p.output || "").trim(),
-      input: String(p.input || "").trim(),
-      hotkey: String(p.hotkey || "").trim(),
-      icon: String(p.icon || "")
+      name: sanitizeText(p.name, maxNameLength),
+      output: sanitizeText(p.output, maxDeviceLength),
+      input: sanitizeText(p.input, maxDeviceLength),
+      hotkey: sanitizeHotkey(p.hotkey),
+      icon: sanitizeIcon(p.icon)
     }
+  }
+
+  // Bound the whole list, not just each entry: cap the count and stop once the
+  // aggregate character budget is spent.
+  function sanitizeProfileList(raw) {
+    if (!Array.isArray(raw)) return []
+    var list = []
+    var total = 0
+    for (var i = 0; i < raw.length && list.length < maxProfiles; i++) {
+      var profile = sanitizeProfile(raw[i])
+      var size = profileChars(profile)
+      if (total + size > maxTotalChars) break
+      total += size
+      list.push(profile)
+    }
+    return list
   }
 
   // ---------------- device lookup / switching ----------------
@@ -258,9 +434,11 @@ Item {
 
   function setDefaultSink(node) {
     if (!node) return false
+    // The Quickshell preference is the immediate switch; the Omarchy helper
+    // additionally persists the default and moves active streams.
     Pipewire.preferredDefaultAudioSink = node
     if (node.id !== undefined && node.name)
-      Quickshell.execDetached(["omarchy-audio-output-set-default", String(node.id), String(node.name)])
+      runHelper([audioOutputHelper, String(node.id), sanitizeText(node.name, maxDeviceLength)], "audio output helper")
     return true
   }
 
@@ -268,7 +446,7 @@ Item {
     if (!node) return false
     Pipewire.preferredDefaultAudioSource = node
     if (node.id !== undefined && node.name)
-      Quickshell.execDetached(["omarchy-audio-input-set-default", String(node.id), String(node.name)])
+      runHelper([audioInputHelper, String(node.id), sanitizeText(node.name, maxDeviceLength)], "audio input helper")
     return true
   }
 
@@ -290,16 +468,15 @@ Item {
   }
 
   function notifyProfile(p) {
-    var icon = String(p.icon || "󰓃")
-    var name = String(p.name || "Unnamed")
+    var icon = sanitizeIcon(p.icon) || "󰓃"
+    var name = sanitizeText(p.name, maxNameLength) || "Unnamed"
     if (notificationPosition === "off") return
     if (notificationPosition === "top-right") {
-      Quickshell.execDetached(["omarchy-notification-send", "-g", icon, "-u", "low", "Profile switched", name])
+      runHelper([notificationHelper, "-g", icon, "-u", "low", "Profile switched", name], "notify")
+    } else if (shell && typeof shell.summon === "function") {
+      shell.summon(moduleName, JSON.stringify({ icon: icon, title: "Profile switched", body: name }))
     } else {
-      if (shell && typeof shell.summon === "function")
-        shell.summon(moduleName, JSON.stringify({ icon: icon, title: "Profile switched", body: name }))
-      else
-        Quickshell.execDetached(["omarchy-osd", "-i", icon, "-m", name])
+      runHelper([osdHelper, "-i", icon, "-m", name], "osd")
     }
   }
 
@@ -343,7 +520,7 @@ Item {
     var icon = muted ? "󰍭" : "󰍬"
     var title = muted ? "Microphone muted" : "Microphone active"
     if (notificationPosition === "top-right") {
-      Quickshell.execDetached(["omarchy-notification-send", "-g", icon, "-u", "low", title])
+      runHelper([notificationHelper, "-g", icon, "-u", "low", title], "notify")
     } else if (shell && typeof shell.summon === "function") {
       shell.summon(moduleName, JSON.stringify({ icon: icon, title: title, body: "" }))
     }
@@ -383,14 +560,14 @@ Item {
     var icon = muted ? "󰖁" : "󰕾"
     var title = muted ? "Output muted" : "Output active"
     if (notificationPosition === "top-right") {
-      Quickshell.execDetached(["omarchy-notification-send", "-g", icon, "-u", "low", title])
+      runHelper([notificationHelper, "-g", icon, "-u", "low", title], "notify")
     } else if (shell && typeof shell.summon === "function") {
       shell.summon(moduleName, JSON.stringify({ icon: icon, title: title, body: "" }))
     }
   }
 
   function activate(index) {
-    var i = parseInt(index, 10)
+    var i = parseIndex(index)
     var p = profiles[i]
     if (!p) {
       lastResult = "unknown"
@@ -464,56 +641,67 @@ Item {
     syncBindings()
   }
 
+  function parseIndex(value) {
+    var index = parseInt(value, 10)
+    return isFinite(index) ? index : -1
+  }
+
   function setCycleHotkey(combo) {
-    cycleHotkey = String(combo || "").trim()
+    cycleHotkey = sanitizeHotkey(combo)
     writeConfig()
     return "ok"
   }
 
   function setPreviousHotkey(combo) {
-    previousHotkey = String(combo || "").trim()
+    previousHotkey = sanitizeHotkey(combo)
     writeConfig()
     return "ok"
   }
 
   function setMicMuteHotkey(combo) {
-    micMuteHotkey = String(combo || "").trim()
+    micMuteHotkey = sanitizeHotkey(combo)
     writeConfig()
     return "ok"
   }
 
   function setOutputMuteHotkey(combo) {
-    outputMuteHotkey = String(combo || "").trim()
+    outputMuteHotkey = sanitizeHotkey(combo)
     writeConfig()
     return "ok"
   }
 
   function setNotificationPosition(pos) {
-    notificationPosition = String(pos || "bottom-center").trim()
+    notificationPosition = sanitizeNotificationPosition(pos)
     writeConfig()
     return "ok"
   }
 
   function addProfile(name, output, input, hotkey, icon) {
+    if (profiles.length >= maxProfiles) return "limit"
     var list = profiles.map(cloneProfile)
-    list.push({ name: name, output: output, input: input, hotkey: hotkey, icon: icon || "" })
+    var profile = sanitizeProfile({ name: name, output: output, input: input, hotkey: hotkey, icon: icon })
+    if (profilesChars(list) + profileChars(profile) > maxTotalChars) return "limit"
+    list.push(profile)
     profiles = list
     writeConfig()
     return "ok"
   }
 
   function updateProfile(index, name, output, input, hotkey, icon) {
-    var i = parseInt(index, 10)
+    var i = parseIndex(index)
     if (i < 0 || i >= profiles.length) return "unknown"
     var list = profiles.map(cloneProfile)
-    list[i] = { name: name, output: output, input: input, hotkey: hotkey, icon: icon || "" }
+    var profile = sanitizeProfile({ name: name, output: output, input: input, hotkey: hotkey, icon: icon })
+    var total = profilesChars(list) - profileChars(list[i]) + profileChars(profile)
+    if (total > maxTotalChars) return "limit"
+    list[i] = profile
     profiles = list
     writeConfig()
     return "ok"
   }
 
   function removeProfile(index) {
-    var i = parseInt(index, 10)
+    var i = parseIndex(index)
     if (i < 0 || i >= profiles.length) return "unknown"
     var list = profiles.map(cloneProfile)
     list.splice(i, 1)
@@ -523,8 +711,8 @@ Item {
   }
 
   function moveProfile(from, to) {
-    var f = parseInt(from, 10)
-    var t = parseInt(to, 10)
+    var f = parseIndex(from)
+    var t = parseIndex(to)
     if (f < 0 || f >= profiles.length || t < 0 || t >= profiles.length) return "unknown"
     var list = profiles.map(cloneProfile)
     var item = list.splice(f, 1)[0]
@@ -593,36 +781,23 @@ Item {
     return lines.join("\n")
   }
 
-  function replaceBlock(current, block) {
-    var start = "-- BEGIN audio-switcher (managed, do not edit)"
-    var end = "-- END audio-switcher (managed, do not edit)"
-    var si = current.indexOf(start)
-    var ei = current.indexOf(end)
-    var head = current
-    var tail = ""
-    if (si !== -1 && ei !== -1 && ei > si) {
-      head = current.slice(0, si)
-      tail = current.slice(ei + end.length)
-    }
-    head = head.replace(/\s+$/, "")
-    tail = tail.replace(/^\s*/, "")
-    if (block)
-      return head + "\n\n" + start + "\n" + block + "\n" + end + "\n" + (tail ? "\n" + tail : "")
-    return (head ? head + "\n" : "") + (tail ? tail + "\n" : "")
-  }
+  // The managed block is handed to a supervised helper that performs a
+  // descriptor-bound, no-follow, ownership-validated transaction. The plugin
+  // never rewrites bindings.lua itself, and unrelated content is preserved.
+  property string syncedBindingsBlock: ""
 
   function syncBindings() {
     if (!configLoaded) return
-    pendingBindingsText = buildBindingsBlock()
-    if (bindingsLoaded) writeBindingsNow()
-    else bindingsFile.reload()
-  }
-
-  function writeBindingsNow() {
-    if (!configLoaded) return
-    var current = String(bindingsFile.text() || "")
-    var updated = replaceBlock(current, pendingBindingsText)
-    if (updated !== current) bindingsFile.setText(updated)
+    var block = buildBindingsBlock()
+    if (block === syncedBindingsBlock) return
+    enqueueJob({
+      argv: [pythonInterpreter, bindingsWriter, block],
+      retries: 4,
+      label: "bindings writer",
+      onExit: function(code) {
+        root.syncedBindingsBlock = (code === 0) ? block : ""
+      }
+    })
   }
 
   Component.onCompleted: readConfig()
