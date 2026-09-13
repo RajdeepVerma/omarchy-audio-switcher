@@ -17,6 +17,7 @@ An [Omarchy](https://omarchy.org/) Quattro shell plugin that switches between **
 - Omarchy Quattro (the Quickshell-based shell).
 - PipeWire + WirePlumber (the standard Omarchy audio stack).
 - Python 3 (`/usr/bin/python3`) for the bundled hotkey-writer helper.
+- util-linux `setsid` (`/usr/bin/setsid`) and `kill` (`/usr/bin/kill`), used to run helpers in their own process group and to enforce the execution deadline.
 - Uses Omarchy-provided helpers: `omarchy-audio-output-set-default`, `omarchy-audio-input-set-default`, `omarchy-osd`, and `omarchy-notification-send`.
 
 ## Install

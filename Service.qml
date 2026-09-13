@@ -251,7 +251,7 @@ Item {
       // If a deadline or output cap ended this job, the direct child may be
       // gone while descendants still hold the inherited pipes. SIGKILL the
       // whole group to reap them before the next job starts.
-      if (root.helperTeardown) signalHelperGroup("KILL")
+      if (root.helperTeardown) root.signalHelperGroup("KILL")
       var job = root.activeJob
       root.activeJob = null
       if (!job) return
@@ -284,9 +284,9 @@ Item {
     repeat: false
     onTriggered: {
       if (!helper.running) return
-      helperTeardown = true
+      root.helperTeardown = true
       console.warn("audio-switcher: helper exceeded " + root.helperTimeoutMs + "ms; terminating group")
-      signalHelperGroup("TERM")
+      root.signalHelperGroup("TERM")
       helperKill.restart()
     }
   }
@@ -300,7 +300,7 @@ Item {
       // request, and make sure the queue can never stall behind a stuck child.
       if (helper.running) {
         console.warn("audio-switcher: helper group ignored termination; killing")
-        signalHelperGroup("KILL")
+        root.signalHelperGroup("KILL")
       } else if (root.activeJob) {
         root.activeJob = null
         root.pumpJobs()
