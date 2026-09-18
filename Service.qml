@@ -114,9 +114,18 @@ Item {
   PersistentProperties {
     id: persisted
     reloadableId: "io.github.solkkku.audio-switcher"
+    // lastProfile: whatever profile is actually active right now, including
+    // an automatic fallback switch. preferredProfile: the profile the user
+    // last explicitly chose - untouched by fallback - so a device that comes
+    // back can be switched back to on its own.
     property string lastProfile: ""
+    property string preferredProfile: ""
     onLoaded: {
       root.persistedLoaded = true
+      // Migrate existing installs: seed the preference from the old single
+      // field so a device that's already back is restored immediately
+      // rather than waiting for the next explicit profile switch.
+      if (!preferredProfile && lastProfile) preferredProfile = lastProfile
       root.applyPersistedProfile()
     }
   }
@@ -559,7 +568,10 @@ Item {
     return true
   }
 
-  function switchProfile(p) {
+  // remember=false marks a switch as involuntary (an automatic fallback),
+  // so it doesn't overwrite what the user actually asked for.
+  function switchProfile(p, remember) {
+    if (remember === undefined) remember = true
     if (!p) {
       lastResult = "unknown"
       return lastResult
@@ -571,6 +583,7 @@ Item {
       return lastResult
     }
     persisted.lastProfile = String(p.name || "")
+    if (remember) persisted.preferredProfile = String(p.name || "")
     lastResult = "ok"
     notifyProfile(p)
     return lastResult
@@ -709,7 +722,10 @@ Item {
 
   function applyPersistedProfile() {
     if (!persistedLoaded || !configLoaded) return
-    var last = String(persisted.lastProfile || "")
+    // Restore the user's actual preference, not just whatever was last
+    // active - those differ when the session ended on an automatic
+    // fallback (e.g. shut down with the Bluetooth earbuds disconnected).
+    var last = String(persisted.preferredProfile || "")
     if (!last) {
       applyTimer.stop()
       return
@@ -760,7 +776,7 @@ Item {
     for (var i = 0; i < profiles.length; i++) {
       if (profiles[i].name !== fallbackProfileName) continue
       if (!findSink(profiles[i].output)) return // fallback device also unavailable
-      switchProfile(profiles[i])
+      switchProfile(profiles[i], false) // involuntary: don't overwrite the real preference
       return
     }
   }
@@ -769,6 +785,33 @@ Item {
     fallbackProfileName = sanitizeFallbackProfileName(name, profiles)
     writeConfig()
     return "ok"
+  }
+
+  // ---------------- automatic restore when the preferred device returns ----
+  // The counterpart to the fallback above: once the profile the user
+  // actually chose has its device back, switch to it - e.g. the Bluetooth
+  // earbuds reconnecting after having fallen back to the speakers.
+  readonly property string preferredProfileOutput: {
+    var pref = String(persisted.preferredProfile || "")
+    for (var i = 0; i < profiles.length; i++)
+      if (profiles[i].name === pref) return String(profiles[i].output || "")
+    return ""
+  }
+  readonly property bool preferredDeviceAvailable: !preferredProfileOutput || !!findSink(preferredProfileOutput)
+
+  onPreferredDeviceAvailableChanged: {
+    if (preferredDeviceAvailable) restorePreferredProfile()
+  }
+
+  function restorePreferredProfile() {
+    var pref = String(persisted.preferredProfile || "")
+    if (!pref || pref === persisted.lastProfile) return // already active
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].name !== pref) continue
+      if (!findSink(profiles[i].output)) return
+      switchProfile(profiles[i])
+      return
+    }
   }
 
   // ---------------- config write ----------------
